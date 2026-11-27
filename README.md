@@ -4,7 +4,7 @@ A session workbench for [omp](https://omp.sh): an all-project session browser, g
 
 ## Features
 
-- **Agents view** — `←` or `Alt+A` on an empty composer, or `/sessions-view`. Browse sessions by directory or state, preview the latest messages, attach, start a new session, stop the current run, and filter.
+- **Agents view** — `←` or `Alt+A` on an empty composer, or `/sessions-view`. Browse sessions by directory (current directory first) or state with a summary header bar, color-coded status glyphs, aligned columns, cached message peek, attach, new session, stop/archive, and live filtering.
 - **Composer shortcuts** — `Shift+Tab` cycles Yolo → Auto → Plan; `Shift+↑` / `Shift+↓` changes the thinking level; `Esc Esc` opens rewind on an empty idle composer.
 - **Auto mode** — classifier-gated approval for non-trivial shell commands and writes outside the workspace. `/auto-mode` controls the mode, including a hard `readonly` lock.
 - **Rewind** — `/checkpoint` or `Esc Esc` restores file checkpoints and/or the conversation branch. File backups live under `~/.omp/agent/file-history/`.
@@ -104,6 +104,7 @@ Redaction is applied to tool results before they reach the model or persisted tr
 ```text
 index.ts            extension entry and gate order
 src/agents-view.ts  fullscreen session browser
+src/agents-format.ts pure formatting helpers
 src/input-router.ts composer key routing
 src/auto-mode.ts    classifier and mode state
 src/classifier.ts   classifier protocol
@@ -115,4 +116,5 @@ src/rewind/         file checkpoint and restore
 src/session-files.ts session transcript helpers
 src/tool-input.ts   shared tool argument parsing
 src/shell.ts        shell command parsing
+test/               unit tests
 ```

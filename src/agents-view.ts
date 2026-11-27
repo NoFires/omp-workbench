@@ -11,7 +11,8 @@ import {
 import { truncate, visibleWidth } from "@oh-my-pi/pi-tui/text/width";
 import { ensureInputRouter } from "./input-router";
 import { viewKeys, type ViewKey, type ViewTheme } from "./ui";
-import { readLatestAssistant, readPreview } from "./session-files";
+import { formatAge, sessionName, STATUS_STYLE, statusKind } from "./agents-format";
+import { type PreviewLine, readLatestAssistant, readPreview } from "./session-files";
 
 const HOME = homedir();
 const PANEL_MIN_HEIGHT = 14;
@@ -24,7 +25,7 @@ type GroupMode = "directory" | "state";
 const GROUP_ORDER: readonly Group[] = ["Pinned", "Working", "Stopped", "Completed", "Failed", "Idle"];
 
 type ListRow =
-	| { kind: "header"; label: string; count: number }
+	| { kind: "header"; label: string; count: number; group?: Group }
 	| { kind: "session"; session: SessionInfo; pinned: boolean };
 
 type ViewResult =
@@ -46,36 +47,27 @@ interface HookResult {
 }
 
 function fit(text: string, width: number): string {
-	return truncate(text, Math.max(0, width), "…", true);
+	if (width <= 0) return "";
+	return truncate(text, width, "…");
 }
 
-function formatAge(date: Date): string {
-	const ms = Math.max(0, Date.now() - date.getTime());
-	if (ms < 60_000) return `${Math.floor(ms / 1000)}s`;
-	if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m`;
-	if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h`;
-	return `${Math.floor(ms / 86_400_000)}d`;
+function padTo(text: string, width: number): string {
+	const w = Math.max(0, width);
+	if (w === 0) return "";
+	const fitted = truncate(text, w, "…");
+	return fitted + " ".repeat(Math.max(0, w - visibleWidth(fitted)));
+}
+
+function rightAlign(text: string, width: number): string {
+	const w = Math.max(0, width);
+	if (w === 0) return "";
+	const fitted = truncate(text, w, "…");
+	return " ".repeat(Math.max(0, w - visibleWidth(fitted))) + fitted;
 }
 
 function shortCwd(cwd: string): string {
 	if (!cwd) return "(unknown)";
 	return cwd === HOME || cwd.startsWith(`${HOME}/`) ? `~${cwd.slice(HOME.length)}` : cwd;
-}
-
-function sessionName(session: SessionInfo): string {
-	const title = session.title?.trim();
-	if (title) return title.split("\n")[0] ?? title;
-	const first = session.firstMessage.trim().split("\n")[0] ?? "";
-	return first ? first.slice(0, 42) : `Untitled · ${session.id.slice(0, 8)}`;
-}
-
-function cleanSummary(text: string): string {
-	return text
-		.replace(/```[\s\S]*?```/g, " ")
-		.replace(/`([^`]*)`/g, "$1")
-		.replace(/[*_#>]+/g, "")
-		.replace(/\s+/g, " ")
-		.trim();
 }
 
 function groupOf(session: SessionInfo, pinned: Set<string>, currentPath: string | undefined, busy: boolean): Group {
@@ -96,34 +88,20 @@ function groupOf(session: SessionInfo, pinned: Set<string>, currentPath: string 
 	}
 }
 
-function statusColor(session: SessionInfo): string {
-	switch (session.status) {
-		case "error":
-			return "error";
-		case "complete":
-			return "success";
-		case "pending":
-		case "interrupted":
-		case "aborted":
-			return "warning";
-		default:
-			return "muted";
-	}
-}
-
-function statusLabel(session: SessionInfo): string {
-	switch (session.status) {
-		case "error":
-			return "Failed";
-		case "complete":
-			return "Done";
-		case "pending":
-			return "Working";
-		case "interrupted":
-		case "aborted":
-			return "Stopped";
-		default:
-			return "Idle";
+function groupGlyph(group: Group, theme: ViewTheme): string {
+	switch (group) {
+		case "Pinned":
+			return theme.fg("accent", "★");
+		case "Working":
+			return theme.fg(STATUS_STYLE.working.color, STATUS_STYLE.working.glyph);
+		case "Stopped":
+			return theme.fg(STATUS_STYLE.stopped.color, STATUS_STYLE.stopped.glyph);
+		case "Completed":
+			return theme.fg(STATUS_STYLE.done.color, STATUS_STYLE.done.glyph);
+		case "Failed":
+			return theme.fg(STATUS_STYLE.failed.color, STATUS_STYLE.failed.glyph);
+		case "Idle":
+			return theme.fg(STATUS_STYLE.idle.color, STATUS_STYLE.idle.glyph);
 	}
 }
 
@@ -142,7 +120,7 @@ async function loadPins(): Promise<Set<string>> {
  * The fullscreen session list. A rows view: omp draws `render(width)` and hands
  * every key to `handleInput` as raw bytes.
  */
-class WorkbenchAgentsView {
+export class WorkbenchAgentsView {
 	readonly #sessions: SessionInfo[];
 	readonly #haystacks: Map<string, string>;
 	readonly #pins: Set<string>;
@@ -169,8 +147,10 @@ class WorkbenchAgentsView {
 	#order: SessionInfo[] = [];
 	readonly #summaries = new Map<string, string>();
 	readonly #summaryPending = new Set<string>();
+	readonly #previews = new Map<string, PreviewLine[]>();
 	#previewPath: string | undefined;
-	#previewLines: string[] | undefined;
+	#previewLines: PreviewLine[] | undefined;
+	#previewError: string | undefined;
 	#previewLoading = false;
 	#previewToken = 0;
 
@@ -243,13 +223,13 @@ class WorkbenchAgentsView {
 			for (const group of GROUP_ORDER) {
 				const members = byGroup.get(group);
 				if (!members) continue;
-				rows.push({ kind: "header", label: group, count: members.length });
+				rows.push({ kind: "header", label: group, count: members.length, group });
 				for (const session of members) rows.push({ kind: "session", session, pinned: this.#pins.has(session.id) });
 			}
 		} else {
 			const pinned = sessions.filter(session => this.#pins.has(session.id));
 			if (pinned.length > 0) {
-				rows.push({ kind: "header", label: "Pinned", count: pinned.length });
+				rows.push({ kind: "header", label: "Pinned", count: pinned.length, group: "Pinned" });
 				for (const session of pinned) rows.push({ kind: "session", session, pinned: true });
 			}
 			const groups = new Map<string, SessionInfo[]>();
@@ -260,7 +240,15 @@ class WorkbenchAgentsView {
 				if (members) members.push(session);
 				else groups.set(cwd, [session]);
 			}
-			for (const [cwd, members] of groups) {
+			const hereResolved = resolve(this.#here);
+			const currentGroup: Array<[string, SessionInfo[]]> = [];
+			const otherGroups: Array<[string, SessionInfo[]]> = [];
+			for (const entry of groups) {
+				const [cwd] = entry;
+				if (cwd !== "(unknown)" && resolve(cwd) === hereResolved) currentGroup.push(entry);
+				else otherGroups.push(entry);
+			}
+			for (const [cwd, members] of [...currentGroup, ...otherGroups]) {
 				rows.push({ kind: "header", label: shortCwd(cwd), count: members.length });
 				for (const session of members) rows.push({ kind: "session", session, pinned: false });
 			}
@@ -295,22 +283,34 @@ class WorkbenchAgentsView {
 		if (!this.#peek) return;
 		const selected = this.#selectedSession();
 		if (!selected) return;
-		if (this.#previewPath === selected.path && this.#previewLines) return;
+		if (this.#previewPath === selected.path && (this.#previewLines !== undefined || this.#previewError !== undefined)) return;
+		const cached = this.#previews.get(selected.path);
+		if (cached) {
+			this.#previewPath = selected.path;
+			this.#previewLines = cached;
+			this.#previewError = undefined;
+			this.#previewLoading = false;
+			return;
+		}
 		const token = ++this.#previewToken;
 		this.#previewPath = selected.path;
 		this.#previewLines = undefined;
+		this.#previewError = undefined;
 		this.#previewLoading = true;
 		this.#requestRender();
 		void readPreview(selected.path).then(
 			lines => {
+				this.#previews.set(selected.path, lines);
 				if (token !== this.#previewToken) return;
-				this.#previewLines = lines.map(line => `${line.role === "user" ? "❯" : "●"} ${line.text}`);
+				this.#previewLines = lines;
+				this.#previewError = undefined;
 				this.#previewLoading = false;
 				this.#requestRender();
 			},
 			() => {
 				if (token !== this.#previewToken) return;
-				this.#previewLines = ["(could not read session file)"];
+				this.#previewLines = undefined;
+				this.#previewError = "(could not read session file)";
 				this.#previewLoading = false;
 				this.#requestRender();
 			},
@@ -355,10 +355,17 @@ class WorkbenchAgentsView {
 		this.#haystacks.delete(session.path);
 		this.#summaries.delete(session.path);
 		this.#summaryPending.delete(session.path);
+		this.#previews.delete(session.path);
 		this.#stopped.delete(session.path);
+		if (this.#previewPath === session.path) {
+			this.#previewPath = undefined;
+			this.#previewLines = undefined;
+			this.#previewError = undefined;
+		}
 		if (this.#selectedPath === session.path) this.#selectedPath = undefined;
 		this.#rowsKey = undefined;
 		this.#ensureSelection();
+		this.#loadPreviewIfOpen();
 		this.#requestRender();
 	}
 
@@ -388,45 +395,118 @@ class WorkbenchAgentsView {
 		return fallback;
 	}
 
+	#renderHeader(width: number): string[] {
+		const theme = this.#theme;
+		const total = this.#sessions.length;
+		const projects = new Set(this.#sessions.map(session => session.cwd || "(unknown)")).size;
+		const sessionWord = total === 1 ? "session" : "sessions";
+		const projectWord = projects === 1 ? "project" : "projects";
+		const left =
+			theme.bold(theme.fg("accent", " Sessions")) +
+			theme.fg("dim", ` · ${total} ${sessionWord} · ${projects} ${projectWord} · by ${this.#groupMode}`);
+		const selectedIndex = this.#order.findIndex(session => session.path === this.#selectedPath);
+		const pos = this.#order.length > 0 ? `${Math.max(0, selectedIndex) + 1}/${this.#order.length}` : "0/0";
+		const right = theme.fg("dim", `${pos} `);
+		const rightW = visibleWidth(right);
+		const leftFit = fit(left, Math.max(0, width - rightW - 1));
+		const gap = Math.max(1, width - visibleWidth(leftFit) - rightW);
+		const bar = fit(`${leftFit}${" ".repeat(gap)}${right}`, width);
+		const sep = theme.fg("borderMuted", "─".repeat(width));
+		return [bar, sep];
+	}
+
+	#renderGroupHeader(row: Extract<ListRow, { kind: "header" }>, width: number): string {
+		const theme = this.#theme;
+		const prefix = row.group ? `${groupGlyph(row.group, theme)} ` : "";
+		const countTag = theme.fg("dim", ` ${row.count} `);
+		const labelBudget = Math.max(4, width - visibleWidth(prefix) - visibleWidth(countTag) - 2);
+		const labelText = fit(row.label, labelBudget);
+		const head = `${prefix}${theme.bold(theme.fg("accent", labelText))}${countTag}`;
+		const ruleLen = Math.max(0, width - visibleWidth(head));
+		return fit(`${head}${theme.fg("borderMuted", "─".repeat(ruleLen))}`, width);
+	}
+
 	#renderSessionLine(row: Extract<ListRow, { kind: "session" }>, width: number): string {
 		const theme = this.#theme;
 		const { session, pinned } = row;
 		const selected = session.path === this.#selectedPath;
 		const current = session.path === this.#currentPath;
-		const bullet = selected ? theme.fg("accent", "*") : theme.fg("dim", "•");
-		const pin = pinned ? theme.fg("accent", "★ ") : "";
-		const name = truncate(sessionName(session), 38, "…");
-		const title = selected ? theme.bold(theme.fg("accent", name)) : theme.bold(theme.fg("text", name));
-		const status = `${theme.fg(statusColor(session), statusLabel(session))}${current ? theme.fg("success", " · current") : ""}`;
-		const summaryWidth = Math.max(32, Math.min(80, Math.floor(width * 0.5)));
-		const summary = truncate(this.#summaryFor(session), summaryWidth, "…");
-		const age = theme.fg("dim", formatAge(session.modified));
-		const left = `${bullet} ${pin}${title}`;
-		const detail = `${theme.fg("dim", "  ·  ")}${theme.fg("muted", summary)}`;
-		const available = width - visibleWidth(left) - visibleWidth(age) - 4;
-		const mid = truncate(`  ${status}${detail}`, Math.max(0, available), "…");
-		const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(mid) - visibleWidth(age) - 1);
-		const line = fit(`${left}${mid}${" ".repeat(gap)} ${age}`, width);
-		return selected ? theme.bg("selectedBg", line) : line;
+		const style = STATUS_STYLE[statusKind(session.status)];
+
+		const cursor = selected ? theme.fg("accent", "❯ ") : "  ";
+		const glyph = `${theme.fg(style.color, style.glyph)} `;
+		const glyphW = visibleWidth(style.glyph) + 1;
+
+		const nameW = Math.min(44, Math.max(16, Math.floor(width * 0.3)));
+		const statusW = 7;
+		const ageW = 4;
+
+		const rawName = sessionName(session.title, session.firstMessage, session.id);
+		const pinPrefix = pinned ? theme.fg("accent", "★ ") : "";
+		const pinW = pinned ? visibleWidth("★ ") : 0;
+		const nameText = fit(rawName, Math.max(0, nameW - pinW));
+		const namePad = " ".repeat(Math.max(0, nameW - pinW - visibleWidth(nameText)));
+		const styledName = selected ? theme.bold(theme.fg("accent", nameText)) : theme.bold(theme.fg("text", nameText));
+		const nameCol = `${pinPrefix}${styledName}${namePad}`;
+
+		const statusCol = current
+			? theme.bold(theme.fg("success", padTo("Current", statusW)))
+			: theme.fg(style.color, padTo(style.label, statusW));
+
+		const ageCol = theme.fg("dim", rightAlign(formatAge(session.modified), ageW));
+		const summaryW = width - 2 - glyphW - nameW - 2 - statusW - 2 - 1 - ageW;
+
+		let line: string;
+		if (summaryW >= 8) {
+			const summaryText = fit(this.#summaryFor(session), summaryW);
+			const summaryPad = " ".repeat(Math.max(0, summaryW - visibleWidth(summaryText)));
+			const summaryCol = `${theme.fg("muted", summaryText)}${summaryPad}`;
+			line = `${cursor}${glyph}${nameCol}  ${statusCol}  ${summaryCol} ${ageCol}`;
+		} else {
+			const left = `${cursor}${glyph}${nameCol}  ${statusCol}`;
+			const gap = Math.max(1, width - visibleWidth(left) - ageW);
+			line = fit(`${left}${" ".repeat(gap)}${ageCol}`, width);
+		}
+
+		if (selected) {
+			const fitted = fit(line, width);
+			return theme.bg("selectedBg", `${fitted}${" ".repeat(Math.max(0, width - visibleWidth(fitted)))}`);
+		}
+		return fit(line, width);
 	}
 
 	#renderPeek(width: number, height: number): string[] {
 		const theme = this.#theme;
 		const selected = this.#selectedSession();
-		const title = selected
-			? `${theme.bold("Peek")} ${theme.fg("dim", "·")} ${theme.bold(sessionName(selected))}`
-			: theme.bold("Peek");
+		const name = selected ? sessionName(selected.title, selected.firstMessage, selected.id) : "";
+		const maxNameW = Math.max(8, width - 18);
+		const lead = selected
+			? `${theme.fg("borderAccent", "── ")}${theme.bold("Peek")}${theme.fg("dim", " · ")}${theme.bold(fit(name, maxNameW))} `
+			: `${theme.fg("borderAccent", "── ")}${theme.bold("Peek")} `;
+		const fillLen = Math.max(0, width - visibleWidth(lead));
+		const borderLine = fit(`${lead}${theme.fg("borderAccent", "─".repeat(fillLen))}`, width);
 		const meta = selected
-			? theme.fg("dim", `${statusLabel(selected)} · ${shortCwd(selected.cwd)} · ${formatAge(selected.modified)}`)
+			? (() => {
+					const style = STATUS_STYLE[statusKind(selected.status)];
+					return theme.fg("dim", `${style.glyph} ${style.label} · ${shortCwd(selected.cwd)} · ${formatAge(selected.modified)}`);
+				})()
 			: "";
-		const lines: string[] = [theme.fg("border", "─".repeat(width)), fit(title, width), fit(meta, width), ""];
+		const lines: string[] = [borderLine, fit(meta, width), ""];
 		const body: string[] = [];
 		if (this.#previewLoading) {
-			body.push(theme.fg("dim", "Loading…"));
+			body.push(theme.fg("dim", "  Loading…"));
+		} else if (this.#previewError) {
+			body.push(theme.fg("dim", `  ${this.#previewError}`));
 		} else if (this.#previewLines?.length) {
-			for (const line of this.#previewLines) body.push(fit(line, width));
+			const textBudget = Math.max(0, width - 4);
+			for (const item of this.#previewLines) {
+				const prefix = item.role === "user" ? theme.fg("accent", "❯") : theme.fg("muted", "●");
+				const content = fit(item.text, textBudget);
+				const styled = item.role === "user" ? theme.fg("text", content) : theme.fg("muted", content);
+				body.push(fit(`  ${prefix} ${styled}`, width));
+			}
 		} else {
-			body.push(theme.fg("dim", "No messages yet."));
+			body.push(theme.fg("dim", "  No messages yet."));
 		}
 		const budget = Math.max(1, height - lines.length - 1);
 		for (const line of body.slice(-budget)) lines.push(line);
@@ -436,29 +516,64 @@ class WorkbenchAgentsView {
 
 	#renderFooter(width: number): string[] {
 		const theme = this.#theme;
-		const prompt = this.#query
-			? `${theme.fg("accent", "❯ ")}${this.#query}`
-			: `${theme.fg("accent", "❯ ")}${theme.fg("dim", "Filter sessions…")}`;
-		const hints = theme.fg(
-			"dim",
-			this.#peek
-				? "↑/↓ move · Space close peek · Enter attach · n new here · Ctrl+X stop/archive · t group · Esc close"
-				: "↑/↓ move · Space peek · Enter attach · n new here · Ctrl+X stop/archive · t group · Esc close · type to filter",
-		);
-		const lines = [fit(prompt, width), fit(hints, width), ""];
-		if (this.#notice) lines.unshift(fit(theme.fg(this.#notice.tone, this.#notice.text), width));
+		const lines: string[] = [];
+		if (this.#notice) {
+			lines.push(fit(theme.fg(this.#notice.tone, this.#notice.text), width));
+		}
+		lines.push(theme.fg("borderMuted", "─".repeat(width)));
+
+		const matchCount = this.#order.length;
+		const right = this.#query
+			? theme.fg("dim", `${matchCount} ${matchCount === 1 ? "match" : "matches"} `)
+			: "";
+		const rightW = visibleWidth(right);
+		const promptPrefix = theme.fg("accent", "❯ ");
+		let promptLeft: string;
+		if (this.#query) {
+			const cursor = theme.fg("accent", "▏");
+			const queryBudget = Math.max(0, width - visibleWidth(promptPrefix) - visibleWidth(cursor) - rightW - (rightW > 0 ? 1 : 0));
+			promptLeft = `${promptPrefix}${fit(this.#query, queryBudget)}${cursor}`;
+		} else {
+			promptLeft = fit(`${promptPrefix}${theme.fg("dim", "Type to filter…")}`, Math.max(0, width - rightW));
+		}
+		const promptGap = rightW > 0 ? Math.max(1, width - visibleWidth(promptLeft) - rightW) : 0;
+		lines.push(rightW > 0 ? fit(`${promptLeft}${" ".repeat(promptGap)}${right}`, width) : fit(promptLeft, width));
+
+		const hints: Array<[string, string]> = [
+			["↑↓", "move"],
+			["⏎", "attach"],
+			["␣", this.#peek ? "close peek" : "peek"],
+			["n", "new"],
+			["^X", "stop/archive"],
+			["t", this.#groupMode === "directory" ? "by state" : "by directory"],
+			["esc", "close"],
+		];
+		const sep = theme.fg("dim", "  ·  ");
+		const sepW = 5;
+		let hintLine = "";
+		let usedW = 0;
+		for (const [key, desc] of hints) {
+			const piece = `${theme.fg("accent", key)} ${theme.fg("dim", desc)}`;
+			const pieceW = visibleWidth(piece);
+			const needed = usedW === 0 ? pieceW : sepW + pieceW;
+			if (usedW + needed > width) break;
+			hintLine += (usedW === 0 ? "" : sep) + piece;
+			usedW += needed;
+		}
+		lines.push(hintLine);
 		return lines;
 	}
 
 	render(width: number): string[] {
 		const safeWidth = Math.max(20, width);
 		const height = Math.max(PANEL_MIN_HEIGHT, this.#rows());
-		const footer = this.#renderFooter(safeWidth);
-		const peekCap = Math.max(0, height - footer.length - 3);
-		const peekHeight = this.#peek ? Math.min(16, Math.max(7, Math.floor(height / 3)), peekCap) : 0;
-		const listHeight = Math.max(1, height - footer.length - peekHeight);
 		const rows = this.#listRows();
 		this.#ensureSelection();
+		const header = this.#renderHeader(safeWidth);
+		const footer = this.#renderFooter(safeWidth);
+		const peekCap = Math.max(0, height - header.length - footer.length - 3);
+		const peekHeight = this.#peek ? Math.min(16, Math.max(7, Math.floor(height / 3)), peekCap) : 0;
+		const listHeight = Math.max(1, height - header.length - footer.length - peekHeight);
 
 		// Lay out first (one line per row, a blank before every header but the
 		// first), then draw only the window: summaries are read for visible rows.
@@ -470,19 +585,24 @@ class WorkbenchAgentsView {
 			layout.push(row);
 		}
 
-		const lines: string[] = [];
+		const lines: string[] = [...header];
 		if (layout.length === 0) {
-			lines.push(fit(this.#theme.fg("dim", "  No sessions match this filter."), safeWidth));
+			if (this.#sessions.length === 0) {
+				lines.push(fit(this.#theme.fg("dim", "  No sessions yet · press n to start one"), safeWidth));
+			} else {
+				lines.push(fit(this.#theme.fg("dim", `  No sessions match "${this.#query.trim()}"`), safeWidth));
+				lines.push(fit(this.#theme.fg("dim", "  Esc clears the filter"), safeWidth));
+			}
 		} else {
 			const maxStart = Math.max(0, layout.length - listHeight);
 			const start = Math.min(maxStart, Math.max(0, (selectedLine < 0 ? 0 : selectedLine) - Math.floor(listHeight / 2)));
 			for (const row of layout.slice(start, start + listHeight)) {
 				if (!row) lines.push("");
-				else if (row.kind === "header") lines.push(fit(this.#theme.fg("accent", row.label), safeWidth));
+				else if (row.kind === "header") lines.push(this.#renderGroupHeader(row, safeWidth));
 				else lines.push(this.#renderSessionLine(row, safeWidth));
 			}
 		}
-		while (lines.length < listHeight) lines.push(" ".repeat(safeWidth));
+		while (lines.length < header.length + listHeight) lines.push(" ".repeat(safeWidth));
 		if (this.#peek) lines.push(...this.#renderPeek(safeWidth, peekHeight));
 		lines.push(...footer);
 		while (lines.length < height) lines.push(" ".repeat(safeWidth));
@@ -685,7 +805,7 @@ export async function showAgentsView(ctx: ExtensionCommandContext): Promise<void
 			} catch (error) {
 				return { ok: false, note: `Archive failed: ${error instanceof Error ? error.message : String(error)}` };
 			}
-			return { ok: true, note: `Archived ${sessionName(session)} → ${archivedDir}` };
+			return { ok: true, note: `Archived ${sessionName(session.title, session.firstMessage, session.id)} → ${archivedDir}` };
 		},
 	};
 
