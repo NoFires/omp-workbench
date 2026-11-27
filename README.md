@@ -31,6 +31,14 @@ The package entry is `index.ts` and declares its extension in `package.json`:
 }
 ```
 
+## Development
+
+Requires Node.js 24+. The tests use `node:test` and run straight from TypeScript:
+
+```sh
+npm test
+```
+
 ## Configuration
 
 Recommended keybindings:

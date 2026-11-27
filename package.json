@@ -4,6 +4,12 @@
 	"private": true,
 	"description": "Session workbench for omp: agents view, guarded automation, rewind, and thinking controls",
 	"type": "module",
+	"engines": {
+		"node": ">=24"
+	},
+	"scripts": {
+		"test": "node --test"
+	},
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/NoFires/omp-workbench.git"
