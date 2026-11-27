@@ -398,7 +398,8 @@ class WorkbenchAgentsView {
 		const name = truncate(sessionName(session), 38, "…");
 		const title = selected ? theme.bold(theme.fg("accent", name)) : theme.bold(theme.fg("text", name));
 		const status = `${theme.fg(statusColor(session), statusLabel(session))}${current ? theme.fg("success", " · current") : ""}`;
-		const summary = truncate(this.#summaryFor(session), 220, "…");
+		const summaryWidth = Math.max(32, Math.min(80, Math.floor(width * 0.5)));
+		const summary = truncate(this.#summaryFor(session), summaryWidth, "…");
 		const age = theme.fg("dim", formatAge(session.modified));
 		const left = `${bullet} ${pin}${title}`;
 		const detail = `${theme.fg("dim", "·")} ${theme.fg("muted", summary)}`;
