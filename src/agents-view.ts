@@ -402,9 +402,9 @@ class WorkbenchAgentsView {
 		const summary = truncate(this.#summaryFor(session), summaryWidth, "…");
 		const age = theme.fg("dim", formatAge(session.modified));
 		const left = `${bullet} ${pin}${title}`;
-		const detail = `${theme.fg("dim", "·")} ${theme.fg("muted", summary)}`;
+		const detail = `${theme.fg("dim", "  ·  ")}${theme.fg("muted", summary)}`;
 		const available = width - visibleWidth(left) - visibleWidth(age) - 4;
-		const mid = truncate(`  ${status} ${detail}`, Math.max(0, available), "…");
+		const mid = truncate(`  ${status}${detail}`, Math.max(0, available), "…");
 		const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(mid) - visibleWidth(age) - 1);
 		const line = fit(`${left}${mid}${" ".repeat(gap)} ${age}`, width);
 		return selected ? theme.bg("selectedBg", line) : line;
