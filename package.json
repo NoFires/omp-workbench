@@ -1,0 +1,14 @@
+{
+	"name": "omp-workbench",
+	"version": "1.2.0",
+	"private": true,
+	"description": "Session workbench for omp: agents view, guarded automation, rewind, and thinking controls",
+	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/NoFires/omp-workbench.git"
+	},
+	"omp": {
+		"extensions": ["./index.ts"]
+	}
+}
