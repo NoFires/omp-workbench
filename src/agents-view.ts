@@ -16,8 +16,6 @@ import { type PreviewLine, readLatestAssistant, readPreview } from "./session-fi
 
 const HOME = homedir();
 const PANEL_MIN_HEIGHT = 14;
-/** A session untouched for this long is treated as closed, so archiving cannot race a live omp. */
-const ARCHIVE_QUIET_MS = 5 * 60_000;
 
 type Group = "Pinned" | "Working" | "Stopped" | "Completed" | "Failed" | "Idle";
 type GroupMode = "directory" | "state";
@@ -759,9 +757,8 @@ export function agentsViewEnter(data: string): string | undefined {
  * Groups by directory, or by state after `t`; pins are omp's own (`/pin`).
  * Enter/→ attaches, Space peeks at the latest messages, `n` starts a new
  * session in the highlighted row's directory, Ctrl+X stops the open session's
- * live run; pressing Ctrl+X twice archives any session (archiving the open
- * session starts a new session first; other sessions changed in the last 5
- * minutes are kept), typing filters, Esc closes.
+ * live run; pressing Ctrl+X twice archives any session immediately (archiving
+ * the open session starts a new session first), typing filters, Esc closes.
  *
  * Sessions from other directories go through the built-in `/resume` and
  * `/move`, the only commands that change the project directory. omp 19.2 lets
@@ -791,7 +788,7 @@ export async function showAgentsView(ctx: ExtensionCommandContext): Promise<void
 		const candidate = "dropSession" in manager ? manager.dropSession : undefined;
 		return typeof candidate === "function" ? (candidate.bind(manager) as (file: string) => Promise<void>) : undefined;
 	};
-	const archiveSession = async (session: SessionInfo, options?: { skipQuietCheck?: boolean }): Promise<HookResult> => {
+	const archiveSession = async (session: SessionInfo): Promise<HookResult> => {
 		if (session.path === ctx.sessionManager.getSessionFile()) {
 			return { ok: false, note: "Switch to another session before archiving this one" };
 		}
@@ -799,17 +796,11 @@ export async function showAgentsView(ctx: ExtensionCommandContext): Promise<void
 		if (!drop) {
 			return { ok: false, note: "This omp build cannot delete sessions from an extension" };
 		}
-		const quiet = await stat(session.path).then(
-			info => Date.now() - info.mtimeMs,
-			() => undefined,
+		const exists = await stat(session.path).then(
+			() => true,
+			() => false,
 		);
-		if (quiet === undefined) return { ok: false, note: "Session file is gone" };
-		if (!options?.skipQuietCheck && quiet < ARCHIVE_QUIET_MS) {
-			return {
-				ok: false,
-				note: `Changed ${formatAge(new Date(Date.now() - quiet))} ago — close its omp first, then archive`,
-			};
-		}
+		if (!exists) return { ok: false, note: "Session file is gone" };
 		const copy = join(archivedDir, `${session.id}.jsonl`);
 		try {
 			await mkdir(archivedDir, { recursive: true });
@@ -818,7 +809,7 @@ export async function showAgentsView(ctx: ExtensionCommandContext): Promise<void
 				recursive: true,
 			}).catch(() => undefined);
 			await drop(session.path);
-			// The index backend may defer the unlink; the session is quiet, so remove it here too.
+			// The index backend may defer the unlink; remove it here too.
 			await rm(session.path, { force: true });
 			await rm(session.path.slice(0, -".jsonl".length), { recursive: true, force: true });
 		} catch (error) {
@@ -909,7 +900,7 @@ export async function showAgentsView(ctx: ExtensionCommandContext): Promise<void
 		} finally {
 			ensureInputRouter(ctx);
 		}
-		const outcome = await archiveSession(result.session, { skipQuietCheck: true });
+		const outcome = await archiveSession(result.session);
 		ctx.ui.notify(outcome.ok ? `${outcome.note} · started a new session` : outcome.note, outcome.ok ? "info" : "warning");
 		return;
 	}
