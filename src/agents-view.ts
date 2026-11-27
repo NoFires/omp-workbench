@@ -1,4 +1,4 @@
-import { copyFile, cp, mkdir, readFile, rm, stat } from "node:fs/promises";
+import { readFile, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -12,10 +12,27 @@ import { truncate, visibleWidth } from "@oh-my-pi/pi-tui/text/width";
 import { ensureInputRouter } from "./input-router";
 import { viewKeys, type ViewKey, type ViewTheme } from "./ui";
 import { cleanSummary, formatAge, sessionName, STATUS_STYLE, statusKind } from "./agents-format";
+import {
+	type ArchivedSessionMeta,
+	backupSessionToArchive,
+	loadArchiveHistory,
+	restoreSessionFromArchive,
+} from "./archive-store";
 import { type PreviewLine, readLatestAssistant, readPreview } from "./session-files";
 
 const HOME = homedir();
 const PANEL_MIN_HEIGHT = 14;
+
+let archiveQueue: Promise<void> = Promise.resolve();
+
+function enqueueArchiveOp<T>(task: () => Promise<T>): Promise<T> {
+	const next = archiveQueue.then(task, task);
+	archiveQueue = next.then(
+		() => undefined,
+		() => undefined,
+	);
+	return next;
+}
 
 type Group = "Pinned" | "Working" | "Stopped" | "Completed" | "Failed" | "Idle";
 type GroupMode = "directory" | "state";
@@ -37,12 +54,27 @@ interface ViewHooks {
 	stop(path: string): Promise<HookResult>;
 	/** Archive `session` off the session list; `ok` is false when it was kept. */
 	archive(session: SessionInfo): Promise<HookResult>;
+	/** Restore an archived session back to its original path. */
+	restore(meta: ArchivedSessionMeta): Promise<HookResult>;
 }
 
-/** Outcome of a Ctrl+X side effect, with the line the view echoes back. */
+/** Outcome of a Ctrl+X / undo side effect, with the line the view echoes back. */
 interface HookResult {
 	readonly ok: boolean;
 	readonly note: string;
+}
+
+interface UndoEntry {
+	readonly meta: ArchivedSessionMeta;
+	readonly session?: SessionInfo;
+	readonly index?: number;
+	readonly pending?: Promise<HookResult>;
+}
+
+function buildSessionHaystack(session: SessionInfo): string {
+	return [session.title ?? "", session.firstMessage, session.cwd, session.status ?? "", session.id]
+		.join(" ")
+		.toLowerCase();
 }
 
 function fit(text: string, width: number): string {
@@ -138,9 +170,10 @@ export class WorkbenchAgentsView {
 	#groupMode: GroupMode = "directory";
 	#finished = false;
 	#acting = false;
-	#armedArchive: string | undefined;
 	#notice: { text: string; tone: "muted" | "warning" | "error" } | undefined;
 	readonly #stopped = new Set<string>();
+	readonly #undoStack: UndoEntry[];
+	#archivedInView = 0;
 	/** Rows for `#rowsKey`; filtering and grouping run once per query/grouping change. */
 	#rowsKey: string | undefined;
 	#list: ListRow[] = [];
@@ -165,14 +198,10 @@ export class WorkbenchAgentsView {
 		rows: () => number,
 		requestRender: () => void,
 		done: (result: ViewResult | undefined) => void,
+		initialUndo: ArchivedSessionMeta[] = [],
 	) {
 		this.#sessions = sessions;
-		this.#haystacks = new Map(
-			sessions.map(session => [
-				session.path,
-				[session.title ?? "", session.firstMessage, session.cwd, session.status ?? "", session.id].join(" ").toLowerCase(),
-			]),
-		);
+		this.#haystacks = new Map(sessions.map(session => [session.path, buildSessionHaystack(session)]));
 		this.#pins = pins;
 		this.#currentPath = currentPath;
 		this.#here = here;
@@ -182,12 +211,18 @@ export class WorkbenchAgentsView {
 		this.#rows = rows;
 		this.#requestRender = requestRender;
 		this.#done = done;
+		this.#undoStack = initialUndo.map(meta => ({ meta }));
 		this.#selectedPath = currentPath && sessions.some(s => s.path === currentPath) ? currentPath : sessions[0]?.path;
 	}
 
 	/** False once the view finished; its keys and the router's interceptor ignore it then. */
 	get open(): boolean {
 		return !this.#finished;
+	}
+
+	/** Number of non-open sessions archived while this view instance was open. */
+	get archivedCount(): number {
+		return this.#archivedInView;
 	}
 
 	/** Close with `result`; later keys are ignored. */
@@ -317,16 +352,16 @@ export class WorkbenchAgentsView {
 		);
 	}
 
-	/** Ctrl+X: stop the live open session, or arm/archive any session on a second press. */
+	/** Ctrl+X: stop the live open session, or immediately archive any session. */
 	async #stopOrArchive(): Promise<void> {
 		if (this.#acting) return;
 		const selected = this.#selectedSession();
 		if (!selected) return;
-		this.#acting = true;
-		try {
-			const isOpen = selected.path === this.#currentPath;
-			const alreadyStopped = this.#stopped.has(selected.path);
-			if (isOpen && !alreadyStopped) {
+		const isOpen = selected.path === this.#currentPath;
+		const alreadyStopped = this.#stopped.has(selected.path);
+		if (isOpen && this.#busy && !alreadyStopped) {
+			this.#acting = true;
+			try {
 				const result = await this.#hooks.stop(selected.path);
 				if (result.ok) {
 					this.#busy = false;
@@ -339,35 +374,100 @@ export class WorkbenchAgentsView {
 					this.#requestRender();
 					return;
 				}
+			} finally {
+				this.#acting = false;
 			}
-			if (this.#armedArchive !== selected.path) {
-				const label = sessionName(selected.title, selected.firstMessage, selected.id);
-				this.#armedArchive = selected.path;
-				this.#notice = {
-					text: isOpen
-						? `Ctrl+X again to archive current session "${label}" (starts a new session)`
-						: `Ctrl+X again to archive "${label}"`,
-					tone: "warning",
-				};
+		}
+		if (isOpen) {
+			this.finish({ kind: "archive-current", session: selected });
+			return;
+		}
+		const orderIndex = this.#order.findIndex(session => session.path === selected.path);
+		const nextPath = this.#order[orderIndex + 1]?.path ?? this.#order[orderIndex - 1]?.path;
+		const origIndex = this.#sessions.indexOf(selected);
+		const meta = toArchivedMeta(selected);
+		this.#forget(selected, nextPath);
+		const pending = this.#hooks.archive(selected);
+		const entry: UndoEntry = { meta, session: selected, index: origIndex, pending };
+		this.#undoStack.push(entry);
+		this.#archivedInView += 1;
+		const label = sessionName(selected.title, selected.firstMessage, selected.id);
+		this.#notice = { text: `Archived "${label}" · press u to undo`, tone: "muted" };
+		this.#requestRender();
+		void pending.then(result => {
+			if (result.ok) return;
+			const stackIdx = this.#undoStack.indexOf(entry);
+			if (stackIdx >= 0) this.#undoStack.splice(stackIdx, 1);
+			this.#archivedInView = Math.max(0, this.#archivedInView - 1);
+			this.#insertSession(selected, origIndex);
+			this.#selectedPath = selected.path;
+			this.#ensureSelection();
+			this.#loadPreviewIfOpen();
+			this.#notice = { text: result.note, tone: "warning" };
+			if (this.open) this.#requestRender();
+		});
+	}
+
+	/** Restore the most recently archived session back into the list. */
+	async #undoArchive(): Promise<void> {
+		if (this.#acting) return;
+		const entry = this.#undoStack.pop();
+		if (!entry) {
+			this.#notice = { text: "Nothing to undo", tone: "muted" };
+			this.#requestRender();
+			return;
+		}
+		this.#acting = true;
+		try {
+			if (entry.pending) {
+				const archiveResult = await entry.pending;
+				if (!archiveResult.ok) return;
+			}
+			const result = await this.#hooks.restore(entry.meta);
+			if (!result.ok) {
+				this.#notice = { text: result.note, tone: "warning" };
 				this.#requestRender();
 				return;
 			}
-			this.#armedArchive = undefined;
-			if (isOpen) {
-				this.finish({ kind: "archive-current", session: selected });
-				return;
-			}
-			const result = await this.#hooks.archive(selected);
-			this.#notice = { text: result.note, tone: result.ok ? "muted" : "warning" };
-			if (result.ok) this.#forget(selected);
-			else this.#requestRender();
+			if (entry.pending) this.#archivedInView = Math.max(0, this.#archivedInView - 1);
+			const restored =
+				entry.session ??
+				({
+					path: entry.meta.path,
+					id: entry.meta.id,
+					cwd: entry.meta.cwd,
+					title: entry.meta.title,
+					firstMessage: entry.meta.firstMessage,
+					status: entry.meta.status,
+					modified: new Date(entry.meta.modifiedMs),
+				} as SessionInfo);
+			this.#insertSession(restored, entry.index);
+			this.#selectedPath = restored.path;
+			this.#ensureSelection();
+			this.#loadPreviewIfOpen();
+			this.#notice = { text: result.note, tone: "muted" };
+			this.#requestRender();
 		} finally {
 			this.#acting = false;
 		}
 	}
 
+	#insertSession(session: SessionInfo, index?: number): void {
+		if (this.#sessions.some(item => item.path === session.path)) return;
+		if (index !== undefined && index >= 0 && index <= this.#sessions.length) {
+			this.#sessions.splice(index, 0, session);
+		} else {
+			this.#sessions.unshift(session);
+		}
+		this.#haystacks.set(session.path, buildSessionHaystack(session));
+		this.#rowsKey = undefined;
+	}
+
 	/** Drop an archived session from the list without closing the view. */
-	#forget(session: SessionInfo): void {
+	#forget(session: SessionInfo, preferredNextPath?: string): void {
+		const orderIndex = this.#order.findIndex(item => item.path === session.path);
+		const fallbackPath =
+			orderIndex >= 0 ? (this.#order[orderIndex + 1]?.path ?? this.#order[orderIndex - 1]?.path) : undefined;
 		const index = this.#sessions.indexOf(session);
 		if (index >= 0) this.#sessions.splice(index, 1);
 		this.#haystacks.delete(session.path);
@@ -375,13 +475,14 @@ export class WorkbenchAgentsView {
 		this.#summaryPending.delete(session.path);
 		this.#previews.delete(session.path);
 		this.#stopped.delete(session.path);
-		if (this.#armedArchive === session.path) this.#armedArchive = undefined;
 		if (this.#previewPath === session.path) {
 			this.#previewPath = undefined;
 			this.#previewLines = undefined;
 			this.#previewError = undefined;
 		}
-		if (this.#selectedPath === session.path) this.#selectedPath = undefined;
+		if (this.#selectedPath === session.path) {
+			this.#selectedPath = preferredNextPath ?? fallbackPath;
+		}
 		this.#rowsKey = undefined;
 		this.#ensureSelection();
 		this.#loadPreviewIfOpen();
@@ -542,9 +643,20 @@ export class WorkbenchAgentsView {
 		lines.push(theme.fg("borderMuted", "─".repeat(width)));
 
 		const matchCount = this.#order.length;
-		const right = this.#query
-			? theme.fg("dim", `${matchCount} ${matchCount === 1 ? "match" : "matches"} `)
-			: "";
+		let right = "";
+		if (this.#query) {
+			right = theme.fg("dim", `${matchCount} ${matchCount === 1 ? "match" : "matches"} `);
+		} else if (this.#undoStack.length > 0) {
+			const top = this.#undoStack[this.#undoStack.length - 1]!;
+			const extra = this.#undoStack.length > 1 ? ` (+${this.#undoStack.length - 1})` : "";
+			const labelBudget = Math.max(6, Math.min(22, width - 32));
+			const topName = fit(sessionName(top.meta.title, top.meta.firstMessage, top.meta.id), labelBudget);
+			const fullBadge = `${theme.fg("warning", "↶")} ${theme.bold(theme.fg("accent", "[u]"))} ${theme.fg("warning", `Undo "${topName}"${extra}`)} `;
+			right =
+				visibleWidth(fullBadge) <= Math.max(0, width - 20)
+					? fullBadge
+					: `${theme.fg("warning", "↶")} ${theme.bold(theme.fg("accent", "[u]"))} ${theme.fg("warning", `Undo${extra}`)} `;
+		}
 		const rightW = visibleWidth(right);
 		const promptPrefix = theme.fg("accent", "❯ ");
 		let promptLeft: string;
@@ -558,12 +670,19 @@ export class WorkbenchAgentsView {
 		const promptGap = rightW > 0 ? Math.max(1, width - visibleWidth(promptLeft) - rightW) : 0;
 		lines.push(rightW > 0 ? fit(`${promptLeft}${" ".repeat(promptGap)}${right}`, width) : fit(promptLeft, width));
 
+		const selected = this.#selectedSession();
+		const isRunningOpen = Boolean(
+			selected && selected.path === this.#currentPath && this.#busy && !this.#stopped.has(selected.path),
+		);
 		const hints: Array<[string, string]> = [
 			["↑↓", "move"],
 			["⏎", "attach"],
 			["␣", this.#peek ? "close peek" : "peek"],
 			["n", "new"],
-			["^X", "stop/archive"],
+			["^X", isRunningOpen ? "stop" : "archive"],
+			...(this.#undoStack.length > 0
+				? ([["u", this.#undoStack.length > 1 ? `undo (${this.#undoStack.length})` : "undo"]] as Array<[string, string]>)
+				: []),
 			["t", this.#groupMode === "directory" ? "by state" : "by directory"],
 			["esc", "close"],
 		];
@@ -656,9 +775,8 @@ export class WorkbenchAgentsView {
 	}
 
 	#handle({ id, text }: ViewKey): void {
-		if (id !== "ctrl+x") {
+		if (id !== "ctrl+x" && id !== "ctrl+r" && !(id === "u" && !this.#query)) {
 			this.#notice = undefined;
-			this.#armedArchive = undefined;
 		}
 		const page = Math.max(2, Math.floor(this.#rows() / 5));
 		switch (id) {
@@ -667,6 +785,9 @@ export class WorkbenchAgentsView {
 				return;
 			case "ctrl+x":
 				void this.#stopOrArchive();
+				return;
+			case "ctrl+r":
+				void this.#undoArchive();
 				return;
 			case "escape":
 				if (this.#peek) {
@@ -727,6 +848,8 @@ export class WorkbenchAgentsView {
 					this.#groupMode = this.#groupMode === "directory" ? "state" : "directory";
 					this.#ensureSelection();
 					this.#requestRender();
+				} else if (!this.#query && id === "u") {
+					void this.#undoArchive();
 				} else if (text) {
 					this.#setQuery(this.#query + text);
 				}
@@ -749,6 +872,76 @@ export function agentsViewEnter(data: string): string | undefined {
 	return view.takeEnter();
 }
 
+function archiveDir(): string {
+	return join(getAgentDir(), "archived-sessions");
+}
+
+function getDropSession(ctx: ExtensionCommandContext): ((file: string) => Promise<void>) | undefined {
+	// `SessionManager.dropSession` exists at runtime; extensions are handed the readonly Pick.
+	const manager = ctx.sessionManager;
+	const candidate = "dropSession" in manager ? manager.dropSession : undefined;
+	return typeof candidate === "function" ? (candidate.bind(manager) as (file: string) => Promise<void>) : undefined;
+}
+
+function toArchivedMeta(session: SessionInfo): ArchivedSessionMeta {
+	return {
+		id: session.id,
+		path: session.path,
+		cwd: session.cwd,
+		title: session.title,
+		firstMessage: session.firstMessage,
+		status: session.status,
+		modifiedMs: session.modified.getTime(),
+		archivedAt: Date.now(),
+	};
+}
+
+function archiveSessionFile(ctx: ExtensionCommandContext, session: SessionInfo): Promise<HookResult> {
+	return enqueueArchiveOp(async () => {
+		if (session.path === ctx.sessionManager.getSessionFile()) {
+			return { ok: false, note: "Switch to another session before archiving this one" };
+		}
+		const drop = getDropSession(ctx);
+		if (!drop) {
+			return { ok: false, note: "This omp build cannot delete sessions from an extension" };
+		}
+		const exists = await stat(session.path).then(
+			() => true,
+			() => false,
+		);
+		if (!exists) return { ok: false, note: "Session file is gone" };
+		const dir = archiveDir();
+		const label = sessionName(session.title, session.firstMessage, session.id);
+		try {
+			await backupSessionToArchive(dir, toArchivedMeta(session));
+			await drop(session.path);
+			// The index backend may defer the unlink; remove it here too.
+			await rm(session.path, { force: true });
+			if (session.path.endsWith(".jsonl")) {
+				await rm(session.path.slice(0, -".jsonl".length), { recursive: true, force: true });
+			}
+		} catch (error) {
+			return { ok: false, note: `Archive failed: ${error instanceof Error ? error.message : String(error)}` };
+		}
+		return { ok: true, note: `Archived "${label}"` };
+	});
+}
+
+function restoreArchivedMeta(meta: ArchivedSessionMeta): Promise<HookResult> {
+	return enqueueArchiveOp(async () => {
+		const label = sessionName(meta.title, meta.firstMessage, meta.id);
+		try {
+			const result = await restoreSessionFromArchive(archiveDir(), meta);
+			if (!result.ok) {
+				return { ok: false, note: result.error ?? `Could not restore "${label}"` };
+			}
+			return { ok: true, note: `Restored "${label}"` };
+		} catch (error) {
+			return { ok: false, note: `Restore failed: ${error instanceof Error ? error.message : String(error)}` };
+		}
+	});
+}
+
 /**
  * Agents view: every omp session in one fullscreen list. Opened by
  * `/sessions-view`, which the router submits on ← / Alt+A with an empty
@@ -756,9 +949,10 @@ export function agentsViewEnter(data: string): string | undefined {
  *
  * Groups by directory, or by state after `t`; pins are omp's own (`/pin`).
  * Enter/→ attaches, Space peeks at the latest messages, `n` starts a new
- * session in the highlighted row's directory, Ctrl+X stops the open session's
- * live run; pressing Ctrl+X twice archives any session immediately (archiving
- * the open session starts a new session first), typing filters, Esc closes.
+ * session in the highlighted row's directory, Ctrl+X stops a running open
+ * session or immediately archives any session (archiving the open session starts
+ * a new session first), `u` / Ctrl+R (or `/undo-archive` after closing) restores
+ * the most recently archived session, typing filters, Esc closes.
  *
  * Sessions from other directories go through the built-in `/resume` and
  * `/move`, the only commands that change the project directory. omp 19.2 lets
@@ -773,62 +967,34 @@ export async function showAgentsView(ctx: ExtensionCommandContext): Promise<void
 
 	let sessions: SessionInfo[];
 	let pins: Set<string>;
+	let initialUndo: ArchivedSessionMeta[];
 	try {
+		await archiveQueue;
 		const listing = await SessionManager.listAllForPicker();
-		[sessions, pins] = await Promise.all([listing.complete, loadPins()]);
+		[sessions, pins, initialUndo] = await Promise.all([
+			listing.complete,
+			loadPins(),
+			loadArchiveHistory(archiveDir()),
+		]);
 	} catch (error) {
 		ctx.ui.notify(`Could not list sessions: ${error instanceof Error ? error.message : String(error)}`, "error");
 		return;
 	}
 
-	const archivedDir = join(getAgentDir(), "archived-sessions");
-	const getDropSession = (): ((file: string) => Promise<void>) | undefined => {
-		// `SessionManager.dropSession` exists at runtime; extensions are handed the readonly Pick.
-		const manager = ctx.sessionManager;
-		const candidate = "dropSession" in manager ? manager.dropSession : undefined;
-		return typeof candidate === "function" ? (candidate.bind(manager) as (file: string) => Promise<void>) : undefined;
-	};
-	const archiveSession = async (session: SessionInfo): Promise<HookResult> => {
-		if (session.path === ctx.sessionManager.getSessionFile()) {
-			return { ok: false, note: "Switch to another session before archiving this one" };
-		}
-		const drop = getDropSession();
-		if (!drop) {
-			return { ok: false, note: "This omp build cannot delete sessions from an extension" };
-		}
-		const exists = await stat(session.path).then(
-			() => true,
-			() => false,
-		);
-		if (!exists) return { ok: false, note: "Session file is gone" };
-		const copy = join(archivedDir, `${session.id}.jsonl`);
-		try {
-			await mkdir(archivedDir, { recursive: true });
-			await copyFile(session.path, copy);
-			await cp(session.path.slice(0, -".jsonl".length), join(archivedDir, session.id), {
-				recursive: true,
-			}).catch(() => undefined);
-			await drop(session.path);
-			// The index backend may defer the unlink; remove it here too.
-			await rm(session.path, { force: true });
-			await rm(session.path.slice(0, -".jsonl".length), { recursive: true, force: true });
-		} catch (error) {
-			return { ok: false, note: `Archive failed: ${error instanceof Error ? error.message : String(error)}` };
-		}
-		return { ok: true, note: `Archived ${sessionName(session.title, session.firstMessage, session.id)} → ${archivedDir}` };
-	};
 	const hooks: ViewHooks = {
 		stop: async path => {
 			if (path !== ctx.sessionManager.getSessionFile()) {
 				return { ok: false, note: "Only the open session's run can be stopped; other sessions run in their own omp process" };
 			}
-			if (ctx.isIdle()) return { ok: false, note: "Session is idle — Ctrl+X archives it once it is stopped" };
+			if (ctx.isIdle()) return { ok: false, note: "Session is idle — press Ctrl+X to archive" };
 			ctx.abort();
-			return { ok: true, note: "Stopped · Ctrl+X twice to archive" };
+			return { ok: true, note: "Stopped · press Ctrl+X to archive" };
 		},
-		archive: session => archiveSession(session),
+		archive: session => archiveSessionFile(ctx, session),
+		restore: meta => restoreArchivedMeta(meta),
 	};
 
+	let viewRef: WorkbenchAgentsView | undefined;
 	const result = await ctx.ui.custom<ViewResult | undefined>((ui, _theme, _keybindings, done) => {
 		const view = new WorkbenchAgentsView(
 			sessions,
@@ -841,13 +1007,24 @@ export async function showAgentsView(ctx: ExtensionCommandContext): Promise<void
 			() => ui.size().rows,
 			() => ui.requestRender(),
 			done,
+			initialUndo,
 		);
 		active = view;
+		viewRef = view;
 		return view;
 	}, { overlay: true, fullscreen: true });
 	active = undefined;
 
-	if (!result) return;
+	if (!result) {
+		const count = viewRef?.archivedCount ?? 0;
+		if (count > 0) {
+			ctx.ui.notify(
+				`Archived ${count} ${count === 1 ? "session" : "sessions"} · run /undo-archive (or press u in sessions view) to undo`,
+				"info",
+			);
+		}
+		return;
+	}
 	if (result.kind === "new") {
 		const here = ctx.sessionManager.getCwd();
 		let target = result.cwd && resolve(result.cwd) !== resolve(here) ? result.cwd : undefined;
@@ -875,7 +1052,7 @@ export async function showAgentsView(ctx: ExtensionCommandContext): Promise<void
 		return;
 	}
 	if (result.kind === "archive-current") {
-		if (!getDropSession()) {
+		if (!getDropSession(ctx)) {
 			ctx.ui.notify("This omp build cannot delete sessions from an extension", "warning");
 			return;
 		}
@@ -900,8 +1077,13 @@ export async function showAgentsView(ctx: ExtensionCommandContext): Promise<void
 		} finally {
 			ensureInputRouter(ctx);
 		}
-		const outcome = await archiveSession(result.session);
-		ctx.ui.notify(outcome.ok ? `${outcome.note} · started a new session` : outcome.note, outcome.ok ? "info" : "warning");
+		const outcome = await archiveSessionFile(ctx, result.session);
+		ctx.ui.notify(
+			outcome.ok
+				? `${outcome.note} · started a new session · run /undo-archive (or press u in sessions view) to undo`
+				: outcome.note,
+			outcome.ok ? "info" : "warning",
+		);
 		return;
 	}
 	if (result.submitted) return;
@@ -923,5 +1105,23 @@ export function registerAgentsView(pi: ExtensionAPI): void {
 	pi.registerCommand("sessions-view", {
 		description: "All-project session browser with preview and attach",
 		handler: async (_args, ctx) => showAgentsView(ctx),
+	});
+	pi.registerCommand("undo-archive", {
+		description: "Restore the most recently archived session",
+		handler: async (_args, ctx) => {
+			await archiveQueue;
+			const history = await loadArchiveHistory(archiveDir());
+			const latest = history.at(-1);
+			if (!latest) {
+				ctx.ui.notify("No archived sessions to restore", "info");
+				return;
+			}
+			const outcome = await restoreArchivedMeta(latest);
+			if (!outcome.ok) {
+				ctx.ui.notify(outcome.note, "warning");
+				return;
+			}
+			ctx.ui.notify(`${outcome.note} · open sessions view (← / Alt+A) or /resume ${latest.id}`, "info");
+		},
 	});
 }

@@ -4,7 +4,7 @@ A session workbench for [omp](https://omp.sh): an all-project session browser, g
 
 ## Features
 
-- **Agents view** — `←` or `Alt+A` on an empty composer, or `/sessions-view`. Browse sessions by directory (current directory first) or state with a summary header bar, color-coded status glyphs, aligned columns, cached message peek, attach, new session, stop/archive, and live filtering.
+- **Agents view** — `←` or `Alt+A` on an empty composer, or `/sessions-view`. Browse sessions by directory (current directory first) or state with a summary header bar, color-coded status glyphs, aligned columns, cached message peek, attach, new session, instant archive with persistent undo (`u` / `Ctrl+R` / `/undo-archive`), and live filtering.
 - **Composer shortcuts** — `Shift+Tab` cycles Yolo → Auto → Plan; `Shift+↑` / `Shift+↓` changes the thinking level; `Esc Esc` opens rewind on an empty idle composer.
 - **Auto mode** — classifier-gated approval for non-trivial shell commands and writes outside the workspace. `/auto-mode` controls the mode, including a hard `readonly` lock.
 - **Rewind** — `/checkpoint` or `Esc Esc` restores file checkpoints and/or the conversation branch. File backups live under `~/.omp/agent/file-history/`.
@@ -73,7 +73,8 @@ Rewind uses `~/.omp/agent/better-pi-rewind.json` for its escape window:
 | Attach / open selected session | `Enter` / `→` |
 | Preview selected session | `Space` |
 | New session | `n` in agents view |
-| Stop current run / archive session | `Ctrl+X` (twice to archive; starts a new session if archiving current) in agents view |
+| Archive session immediately (stops running current session first) | `Ctrl+X` in agents view |
+| Undo last archive | `u` / `Ctrl+R` in agents view, or `/undo-archive` |
 | Filter sessions | type in agents view |
 | Cycle mode | `Shift+Tab` |
 | Open rewind | `Esc Esc` / `/checkpoint` |
@@ -105,6 +106,7 @@ Redaction is applied to tool results before they reach the model or persisted tr
 index.ts            extension entry and gate order
 src/agents-view.ts  fullscreen session browser
 src/agents-format.ts pure formatting helpers
+src/archive-store.ts archive backup & undo history
 src/input-router.ts composer key routing
 src/auto-mode.ts    classifier and mode state
 src/classifier.ts   classifier protocol
