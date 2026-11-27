@@ -139,6 +139,7 @@ export class WorkbenchAgentsView {
 	#groupMode: GroupMode = "directory";
 	#finished = false;
 	#acting = false;
+	#armedArchive: string | undefined;
 	#notice: { text: string; tone: "muted" | "warning" | "error" } | undefined;
 	readonly #stopped = new Set<string>();
 	/** Rows for `#rowsKey`; filtering and grouping run once per query/grouping change. */
@@ -317,32 +318,43 @@ export class WorkbenchAgentsView {
 		);
 	}
 
-	/** Ctrl+X: stop the live run, or archive a session that is already stopped. */
+	/** Ctrl+X: stop the live open session, or arm/archive any session on a second press. */
 	async #stopOrArchive(): Promise<void> {
 		if (this.#acting) return;
 		const selected = this.#selectedSession();
 		if (!selected) return;
 		this.#acting = true;
 		try {
-			const stopped = this.#stopped.has(selected.path) || selected.status === "interrupted" || selected.status === "aborted";
-			if (stopped) {
-				const result = await this.#hooks.archive(selected);
+			const isOpen = selected.path === this.#currentPath;
+			const alreadyStopped = this.#stopped.has(selected.path);
+			if (isOpen && !alreadyStopped) {
+				const result = await this.#hooks.stop(selected.path);
+				if (result.ok) {
+					this.#busy = false;
+					selected.status = "interrupted";
+					this.#stopped.add(selected.path);
+					this.#rowsKey = undefined;
+				}
 				this.#notice = { text: result.note, tone: result.ok ? "muted" : "warning" };
-				if (result.ok) this.#forget(selected);
-				else this.#requestRender();
-				return;
+				if (result.ok || !result.note.startsWith("Session is idle")) {
+					this.#requestRender();
+					return;
+				}
 			}
-			const result = await this.#hooks.stop(selected.path);
-			this.#notice = { text: result.note, tone: result.ok ? "muted" : "warning" };
-			if (!result.ok) {
+			if (this.#armedArchive !== selected.path) {
+				this.#armedArchive = selected.path;
+				this.#notice = {
+					text: `Ctrl+X again to archive "${sessionName(selected.title, selected.firstMessage, selected.id)}"`,
+					tone: "warning",
+				};
 				this.#requestRender();
 				return;
 			}
-			this.#busy = false;
-			selected.status = "interrupted";
-			this.#stopped.add(selected.path);
-			this.#rowsKey = undefined;
-			this.#requestRender();
+			this.#armedArchive = undefined;
+			const result = await this.#hooks.archive(selected);
+			this.#notice = { text: result.note, tone: result.ok ? "muted" : "warning" };
+			if (result.ok) this.#forget(selected);
+			else this.#requestRender();
 		} finally {
 			this.#acting = false;
 		}
@@ -357,6 +369,7 @@ export class WorkbenchAgentsView {
 		this.#summaryPending.delete(session.path);
 		this.#previews.delete(session.path);
 		this.#stopped.delete(session.path);
+		if (this.#armedArchive === session.path) this.#armedArchive = undefined;
 		if (this.#previewPath === session.path) {
 			this.#previewPath = undefined;
 			this.#previewLines = undefined;
@@ -637,7 +650,10 @@ export class WorkbenchAgentsView {
 	}
 
 	#handle({ id, text }: ViewKey): void {
-		if (id !== "ctrl+x") this.#notice = undefined;
+		if (id !== "ctrl+x") {
+			this.#notice = undefined;
+			this.#armedArchive = undefined;
+		}
 		const page = Math.max(2, Math.floor(this.#rows() / 5));
 		switch (id) {
 			case "ctrl+c":
@@ -735,8 +751,8 @@ export function agentsViewEnter(data: string): string | undefined {
  * Groups by directory, or by state after `t`; pins are omp's own (`/pin`).
  * Enter/→ attaches, Space peeks at the latest messages, `n` starts a new
  * session in the highlighted row's directory, Ctrl+X stops the open session's
- * run and stays in the view, a second Ctrl+X on a stopped session archives it
- * off the list, typing filters, Esc closes.
+ * live run; on any other session, Ctrl+X twice archives it (sessions changed in
+ * the last 5 minutes are kept), typing filters, Esc closes.
  *
  * Sessions from other directories go through the built-in `/resume` and
  * `/move`, the only commands that change the project directory. omp 19.2 lets
@@ -767,7 +783,7 @@ export async function showAgentsView(ctx: ExtensionCommandContext): Promise<void
 			}
 			if (ctx.isIdle()) return { ok: false, note: "Session is idle — Ctrl+X archives it once it is stopped" };
 			ctx.abort();
-			return { ok: true, note: "Stopped · Ctrl+X again to archive" };
+			return { ok: true, note: "Stopped · switch to another session to archive this one" };
 		},
 		archive: async session => {
 			if (session.path === ctx.sessionManager.getSessionFile()) {
