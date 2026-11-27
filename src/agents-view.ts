@@ -11,7 +11,7 @@ import {
 import { truncate, visibleWidth } from "@oh-my-pi/pi-tui/text/width";
 import { ensureInputRouter } from "./input-router";
 import { viewKeys, type ViewKey, type ViewTheme } from "./ui";
-import { formatAge, sessionName, STATUS_STYLE, statusKind } from "./agents-format";
+import { cleanSummary, formatAge, sessionName, STATUS_STYLE, statusKind } from "./agents-format";
 import { type PreviewLine, readLatestAssistant, readPreview } from "./session-files";
 
 const HOME = homedir();
