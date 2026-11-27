@@ -73,7 +73,7 @@ Rewind uses `~/.omp/agent/better-pi-rewind.json` for its escape window:
 | Attach / open selected session | `Enter` / `→` |
 | Preview selected session | `Space` |
 | New session | `n` in agents view |
-| Stop current run / archive session | `Ctrl+X` (twice to archive) in agents view |
+| Stop current run / archive session | `Ctrl+X` (twice to archive; starts a new session if archiving current) in agents view |
 | Filter sessions | type in agents view |
 | Cycle mode | `Shift+Tab` |
 | Open rewind | `Esc Esc` / `/checkpoint` |
